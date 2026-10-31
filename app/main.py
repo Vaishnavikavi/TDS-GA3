@@ -16,7 +16,8 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("safe_ai_mailroom")
 
 PROFILE = "ga5-mailroom-action-gate/v2"
-DB_PATH = os.getenv("DB_PATH", "/data/mailroom.sqlite3")
+# Use /tmp for ephemeral storage on Render if /data persistent disk is not attached
+DB_PATH = os.getenv("DB_PATH", "/tmp/mailroom.sqlite3")
 MAX_BODY = 2_000_000
 ACTIONS = {
     "create_draft",
@@ -51,7 +52,7 @@ def connect():
   c = sqlite3.connect(DB_PATH, timeout=20)
   c.execute("PRAGMA journal_mode=WAL")
   c.execute("""CREATE TABLE IF NOT EXISTS evaluations(
-      evaluation_id TEXT PRIMARY KEY, input_digest TEXT NOT NULL, verifier_jwk TEXT NOT NULL,
+      evaluation_id TEXT PRIMARY KEY, input_digest TEXT NOT NULL, verifier_jwk TEXT,
       request_json TEXT NOT NULL, response_json TEXT NOT NULL, state TEXT NOT NULL, commit_json TEXT, outcome_json TEXT)""")
   c.execute("""CREATE TABLE IF NOT EXISTS cache(
       fingerprint TEXT PRIMARY KEY, proposal_json TEXT NOT NULL)""")
@@ -299,7 +300,7 @@ async def mailroom_endpoint(request: Request):
           (
               eval_id,
               input_digest,
-              json.dumps(verifier),
+              json.dumps(verifier) if verifier else None,
               json.dumps(body),
               json.dumps(response_data),
               "awaiting_receipts",
@@ -328,7 +329,11 @@ async def mailroom_endpoint(request: Request):
 
       propose_resp = json.loads(propose_resp_str)
       stored_props = {p["dossierId"]: p for p in propose_resp["proposals"]}
-      verifier_jwk = json.loads(verifier_jwk_str)
+      verifier_jwk = (
+          json.loads(verifier_jwk_str) if verifier_jwk_str else None
+      )
+      if not verifier_jwk or "x" not in verifier_jwk:
+        return fail(400, "Missing or invalid receipt verifier key")
 
       outcomes = []
       for r in receipts:
