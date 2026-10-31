@@ -177,11 +177,10 @@ def validate_proposal(p, d, allowed):
     if ev not in valid_lids:
       raise ValueError(f"invalid evidence lineId: {ev}")
 
-  # Clean and return normalized proposal
   dossier_id = d["dossierId"]
-  clean_id = "".join(
-      c for c in dossier_id if c.isalnum() or c in "._:-"
-  ) or "dossier"
+  clean_id = (
+      "".join(c for c in dossier_id if c.isalnum() or c in "._:-") or "dossier"
+  )
   call_id = f"call_{clean_id[:40]}"[:128]
 
   return {
@@ -231,7 +230,6 @@ async def mailroom_endpoint(request: Request):
 
       input_digest = sha(dossiers)
 
-      # Check existing evaluation
       cur = db.cursor()
       cur.execute(
           "SELECT input_digest, response_json FROM evaluations WHERE"
@@ -263,7 +261,150 @@ async def mailroom_endpoint(request: Request):
           try:
             prop = validate_proposal(raw_prop, d, allowed_actions)
           except Exception:
-            # Fallback safe action on model validation error
             all_lids = [
                 l.get("lineId")
                 for s in d.get("sources", [])
+                for l in s.get("lines", [])
+            ]
+            prop = {
+                "dossierId": d["dossierId"],
+                "callId": f"call_{d['dossierId'][:30]}",
+                "action": "no_action",
+                "target": None,
+                "payload": {
+                    "reasonCode": "INFORMATIONAL",
+                    "referenceId": d["dossierId"],
+                },
+                "evidence": [all_lids[0] if all_lids else "line_1"],
+            }
+          cur.execute(
+              "INSERT OR REPLACE INTO cache (fingerprint, proposal_json)"
+              " VALUES (?, ?)",
+              (d_fingerprint, json.dumps(prop)),
+          )
+        proposals.append(prop)
+
+      response_data = {
+          "profile": PROFILE,
+          "evaluationId": eval_id,
+          "status": "awaiting_receipts",
+          "inputDigest": input_digest,
+          "proposals": proposals,
+      }
+
+      cur.execute(
+          "INSERT OR REPLACE INTO evaluations (evaluation_id, input_digest,"
+          " verifier_jwk, request_json, response_json, state) VALUES (?, ?, ?,"
+          " ?, ?, ?)",
+          (
+              eval_id,
+              input_digest,
+              json.dumps(verifier),
+              json.dumps(body),
+              json.dumps(response_data),
+              "awaiting_receipts",
+          ),
+      )
+      db.commit()
+      return JSONResponse(status_code=200, content=response_data)
+
+    elif operation == "commit":
+      receipts = body.get("receipts", [])
+      input_digest = body.get("inputDigest")
+
+      cur = db.cursor()
+      cur.execute(
+          "SELECT input_digest, verifier_jwk, response_json FROM evaluations"
+          " WHERE evaluation_id = ?",
+          (eval_id,),
+      )
+      row = cur.fetchone()
+      if not row:
+        return fail(400, "Unknown evaluationId for commit")
+
+      stored_digest, verifier_jwk_str, propose_resp_str = row
+      if stored_digest != input_digest:
+        return fail(409, "Input digest mismatch in commit")
+
+      propose_resp = json.loads(propose_resp_str)
+      stored_props = {p["dossierId"]: p for p in propose_resp["proposals"]}
+      verifier_jwk = json.loads(verifier_jwk_str)
+
+      outcomes = []
+      for r in receipts:
+        dossier_id = r.get("dossierId")
+        call_id = r.get("callId")
+        action = r.get("action")
+        accepted = r.get("accepted", False)
+        receipt_id = r.get("receiptId")
+        signature_b64 = r.get("receiptSignature")
+        proposal_digest = r.get("proposalDigest")
+
+        stored_prop = stored_props.get(dossier_id)
+        if (
+            not stored_prop
+            or stored_prop["callId"] != call_id
+            or stored_prop["action"] != action
+        ):
+          return fail(400, "Receipt parameters do not match proposal")
+
+        norm_prop = {
+            "dossierId": stored_prop.get("dossierId"),
+            "callId": stored_prop.get("callId"),
+            "action": stored_prop.get("action"),
+            "target": stored_prop.get("target"),
+            "payload": stored_prop.get("payload"),
+            "evidence": sorted(stored_prop.get("evidence", [])),
+        }
+        expected_prop_digest = sha(norm_prop)
+        if proposal_digest != expected_prop_digest:
+          return fail(400, "Proposal digest mismatch")
+
+        signed_obj = {
+            "profile": PROFILE,
+            "evaluationId": eval_id,
+            "inputDigest": input_digest,
+            "receipt": {
+                "dossierId": dossier_id,
+                "callId": call_id,
+                "action": action,
+                "accepted": accepted,
+                "proposalDigest": proposal_digest,
+                "receiptId": receipt_id,
+            },
+        }
+        message_bytes = canon(signed_obj)
+
+        try:
+          x_b64 = verifier_jwk["x"]
+          padding = "=" * (-len(x_b64) % 4)
+          x_bytes = base64.urlsafe_b64decode(x_b64 + padding)
+          public_key = Ed25519PublicKey.from_public_bytes(x_bytes)
+          public_key.verify(base64.b64decode(signature_b64), message_bytes)
+        except Exception:
+          return fail(400, "Invalid receipt Ed25519 signature")
+
+        status_result = "executed" if accepted else "rejected"
+        outcomes.append({
+            "dossierId": dossier_id,
+            "callId": call_id,
+            "action": action,
+            "proposalDigest": proposal_digest,
+            "receiptId": receipt_id,
+            "status": status_result,
+        })
+
+      response_data = {
+          "profile": PROFILE,
+          "evaluationId": eval_id,
+          "status": "completed",
+          "inputDigest": input_digest,
+          "outcomes": outcomes,
+      }
+      return JSONResponse(status_code=200, content=response_data)
+
+    else:
+      return fail(400, "Invalid operation")
+
+  finally:
+    db.close()
